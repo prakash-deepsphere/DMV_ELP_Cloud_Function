@@ -1,0 +1,8 @@
+pandas
+fsspec
+s3fs
+requests
+google-cloud-storage
+google-cloud-bigquery
+boto3
+db-dtypes

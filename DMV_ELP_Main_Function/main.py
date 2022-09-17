@@ -1,0 +1,178 @@
+import pandas as pd
+import requests
+import json
+import datetime
+import time
+import traceback
+import  multiprocessing as mp
+import sys
+from google.cloud import storage
+import os
+
+from DMV_ELP_Request_Upload_To_GCS import Upload_Request_GCS
+from DMV_ELP_Mapping_Response_To_Bigquery import Process_API_Response
+from DMV_ELP_Response_To_S3 import Upload_Response_To_S3
+from DMV_ELP_Response_To_Bigquery import Insert_Response_to_Bigquery,Insert_Response_to_Bigquery_Copy
+from DMV_ELP_Request_To_Bigquery import Insert_Request_To_Bigquery
+from DMV_ELP_Bigquery_Request_Validation import GetCurrentDateRequestCount,ReadNotProcessedRequestData,InsertRequesResponseMetaData
+from DMV_ELP_Request_Delete import DeleteProcessedConfigs
+from DMV_ELP_Update_Metadata_Table import UpdateMetadataTable
+from DMV_ELP_Update_ErrorLog import InsertErrorLog
+
+def Process_ELP_Orders(request):
+   
+   vAR_gcs_client = storage.Client()
+   vAR_bucket = vAR_gcs_client.get_bucket(os.environ['GCS_BUCKET_NAME'])
+   vAR_utc_time = datetime.datetime.now()
+   blob = vAR_bucket.blob('processing_files/'+vAR_utc_time.strftime('%Y%m%d')+'/'+vAR_utc_time.strftime('%H%M%S')+'.txt')
+   vAR_processed_configs = []
+   
+   with blob.open(mode='w') as f:
+      try:
+         vAR_process_start_time = datetime.datetime.now().replace(microsecond=0)
+         vAR_timeout_start = time.time()
+         vAR_request_json = request.get_json(silent=True)
+         vAR_s3_url = vAR_request_json['S3_URL']
+         vAR_s3_url_copy = vAR_s3_url.replace('.csv','').replace('s3://','').replace('/','')
+         
+         vAR_timeout_secs = 900
+         pool = mp.Pool(mp.cpu_count())
+         if vAR_s3_url.startswith('s3'):
+            vAR_request_url = os.environ['REQUEST_URL']
+            vAR_output = pd.DataFrame()
+            vAR_batch_input = None
+            vAR_headers = {'content-type': 'application/json','user-agent': 'Mozilla/5.0'}
+            vAR_batch_elp_configuration = pd.read_csv(vAR_s3_url)
+            vAR_number_of_configuration = len(vAR_batch_elp_configuration)
+            vAR_error_message = ""
+            vAR_current_date_request_count = GetCurrentDateRequestCount()
+            
+            if vAR_current_date_request_count==0:
+               Insert_Request_To_Bigquery(vAR_batch_elp_configuration,vAR_number_of_configuration)
+               InsertRequesResponseMetaData(vAR_number_of_configuration)
+            
+            UpdateMetadataTable()
+
+
+            Upload_Request_GCS(vAR_batch_elp_configuration)
+
+            print('Request file successfully uploaded into gcs bucket')
+
+            
+
+            f.write('Start Time - {}\n\n'.format(vAR_process_start_time))
+            f.write('Order No\t\t\t Start Time\t\t\t End Time\t\t\t Total Time\n')
+            
+
+            vAR_configuration_df = ReadNotProcessedRequestData()
+            vAR_configuration_df_len = len(vAR_configuration_df)
+            print('There are '+str(vAR_configuration_df_len)+' configurations yet to be processed')
+
+            vAR_output_result_objects = [pool.apply_async(Process_ELP_Request,args=(vAR_configuration_df,elp_idx,vAR_request_url,vAR_headers)) for elp_idx in range(vAR_configuration_df_len)]
+
+            vAR_results = []
+            for vAR_result in vAR_output_result_objects:
+               print('Time taking in for loop - ',time.time()-vAR_timeout_start)
+               if (time.time()-vAR_timeout_start)<vAR_timeout_secs:
+                  
+                  if len(vAR_result.get()['ERROR_MESSAGE'])>0:
+                     InsertErrorLog(vAR_result.get())
+                  else:
+                     print(vAR_result.get()["Process Time"])
+                     f.write(vAR_result.get()["Process Time"])
+                     del vAR_result.get()['Process Time']
+                     vAR_results.append(vAR_result.get())
+                     Insert_Response_to_Bigquery_Copy(pd.DataFrame(vAR_result.get(),index=[0]))
+                     print(vAR_result.get()['CONFIGURATION']+' Inserted into response table')
+                     DeleteProcessedConfigs()
+                     print(vAR_result.get()['CONFIGURATION']+' delete from request table')
+                     vAR_processed_configs.append(vAR_result.get()['CONFIGURATION'])
+               else:
+                  
+                  raise TimeoutError('Timeout Error inside result iteration')
+               
+               
+
+                      
+            # Close Pool and let all the processes complete
+            pool.close()
+            # postpones the execution of next line of code until all processes in the queue are done.
+            pool.join()  
+
+
+            vAR_process_end_time = datetime.datetime.now().replace(microsecond=0)
+            vAR_total_processing_time = vAR_process_end_time-vAR_process_start_time
+
+
+            f.write('\n\nEnd Time - {}\nTotal Processing Time - {}'.format(vAR_process_end_time,vAR_total_processing_time))
+            return 'ELP Configurations Successfully Processed'
+
+
+         else:
+            return 'Input configuration file not found in S3'
+      
+
+      except TimeoutError as timeout:
+         print('TIMEOUTERR - Custom Timeout Error')
+         vAR_process_end_time = datetime.datetime.now().replace(microsecond=0)
+         vAR_total_processing_time = vAR_process_end_time-vAR_process_start_time
+         f.write('\n\nEnd Time - {}\nTotal Processing Time - {}'.format(vAR_process_end_time,vAR_total_processing_time))
+         print('\n\nEnd Time - {}\nTotal Processing Time - {}'.format(vAR_process_end_time,vAR_total_processing_time))
+         # If we try with pool.terminate() after this return statement not executing
+         # time.sleep(2)
+         # pool.terminate()
+         # print('Pool terminated')
+         print('Number of Processed configs - ',len(vAR_processed_configs))
+         return {'Error Message':'### Custom Timeout Error Occured'}
+
+      except ConnectionError as connectionerror:
+         print('HTTPCONNECTIONERR - Http connection error occurred')
+         print('Error Traceback - '+str(traceback.print_exc()))
+         print('Number of Processed configs - ',len(vAR_processed_configs))
+         return {'Error Message':'### ConnectionError Occured'}
+      
+      except BaseException as e:
+         print('BASEEXCEPTIONERR - '+str(e))
+         print('Error Traceback - '+str(traceback.print_exc()))
+         vAR_process_end_time = datetime.datetime.now().replace(microsecond=0)
+         vAR_total_processing_time = vAR_process_end_time-vAR_process_start_time
+         f.write('\n\nEnd Time - {}\nTotal Processing Time - {}'.format(vAR_process_end_time,vAR_total_processing_time))
+         print('Number of Processed configs - ',len(vAR_processed_configs))
+         return {'Error Message':'### '+str(e)}
+
+      
+
+
+
+def Process_ELP_Request(vAR_batch_elp_configuration,elp_idx,vAR_request_url,vAR_headers):
+
+   vAR_request_start_time = datetime.datetime.now().replace(microsecond=0)
+   configuration = vAR_batch_elp_configuration['CONFIGURATION'][elp_idx]
+   vAR_model = "RNN"
+   vAR_order_date = vAR_batch_elp_configuration['ORDER_DATE'][elp_idx]
+   vAR_order_id = vAR_batch_elp_configuration['ORDER_ID'][elp_idx]
+   vAR_sg_id = vAR_batch_elp_configuration['SG_ID'][elp_idx]
+   vAR_order_group_id = vAR_batch_elp_configuration['ORDER_GROUP_ID'][elp_idx]
+   vAR_request_date = vAR_batch_elp_configuration['REQUEST_DATE'][elp_idx]
+   vAR_payload = {"CONFIGURATION":str(configuration),"MODEL":str(vAR_model),"ORDER_DATE":str(vAR_order_date),"ORDER_ID":str(vAR_order_id),"ORDER_GROUP_ID":str(vAR_order_group_id),"SG_ID":str(vAR_sg_id),"REQUEST_DATE":str(vAR_request_date)}
+   
+   print('Payload - ',vAR_payload)
+   vAR_request = requests.post(vAR_request_url, data=json.dumps(vAR_payload),headers=vAR_headers)
+   
+   vAR_result = vAR_request.text #Getting response as str
+   print('vAR_result - ',vAR_result)
+   vAR_result = json.loads(vAR_result) #converting str to dict
+   if len(vAR_result["Error Message"])>0:
+      print('Below Error in Order Id - '+str(vAR_batch_elp_configuration['ORDER_ID'][elp_idx]))
+      print(vAR_result)
+      vAR_error_message = vAR_result["Error Message"]
+      
+   print('Order Id - '+str(vAR_batch_elp_configuration['ORDER_ID'][elp_idx])+' Successfully processed')
+   vAR_response_dict = Process_API_Response(vAR_result)
+   vAR_request_end_time = datetime.datetime.now().replace(microsecond=0)
+   vAR_each_request_time = vAR_request_end_time-vAR_request_start_time
+   print('processed - ',elp_idx)
+   # Adding Process time for file object to write, since we can't directly use file object in parallel processing(later this column can be removed)
+   vAR_response_dict["Process Time"] = '{}\t\t\t{}\t\t\t{}\t\t{}\n'.format(elp_idx,vAR_request_start_time,vAR_request_end_time,vAR_each_request_time)
+   return vAR_response_dict
+   
